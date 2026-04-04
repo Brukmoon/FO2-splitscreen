@@ -1,0 +1,17 @@
+## FlatOut 2 Splitscreen — Session Configuration
+## Edit this file or use: fo2-splitscreen config --create
+
+game_dir: "C:\\Games\\FlatOut2"
+instance_count: 2
+resolution: [640, 480]
+skip_intros: true
+log_level: INFO
+
+controller_assignments: []  # Leave empty for keyboard-only
+
+window_positions: []  # Leave empty for auto-layout
+
+network:
+  host_port: 23756
+  game_port: 23757
+  port_stride: 4
