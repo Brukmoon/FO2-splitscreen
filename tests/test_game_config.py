@@ -25,13 +25,13 @@ def _make_game_dir() -> Path:
     struct.pack_into("<II", device_data, 0x78, 800, 600)
     (sg / "device.cfg").write_bytes(device_data)
 
-    # Create a mock options.cfg
+    # Create a mock options.cfg (latin-1 encoded, like the real game)
     options_text = (
         'Settings.Control.Controller = 1\n'
         'Settings.Control.ControllerGUID = "12345678-abcd-1234-abcd-123456789012"\n'
         'Settings.Online.LANPort = 23756\n'
     )
-    (sg / "options.cfg").write_text(options_text)
+    (sg / "options.cfg").write_text(options_text, encoding="latin-1")
 
     return tmp
 
@@ -110,7 +110,7 @@ def test_set_lan_port_when_missing():
     game_dir = _make_game_dir()
     sg = game_dir / "Savegame"
     # Write options without LANPort
-    (sg / "options.cfg").write_text("Settings.Control.Controller = 0\n")
+    (sg / "options.cfg").write_text("Settings.Control.Controller = 0\n", encoding="latin-1")
 
     set_lan_port(game_dir, 23760)
 

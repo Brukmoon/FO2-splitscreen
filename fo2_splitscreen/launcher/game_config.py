@@ -1,7 +1,7 @@
 """Read and modify FlatOut 2 configuration files (device.cfg, options.cfg).
 
 device.cfg is a binary file. Resolution is stored as two uint32 values at offset 0x78.
-options.cfg is a Lua-like text file with key = value pairs.
+options.cfg is a Lua-like text file — ANSI-encoded (latin-1), NOT UTF-8.
 """
 
 from __future__ import annotations
@@ -20,6 +20,10 @@ SAVEGAME_DIR = "Savegame"
 DEVICE_CFG = "device.cfg"
 OPTIONS_CFG = "options.cfg"
 BACKUP_SUFFIX = ".bak.fo2ss"
+
+# FlatOut 2 (2006) uses ANSI encoding for its config files.
+# Using latin-1 preserves all bytes 1:1 on read/write.
+OPTIONS_ENCODING = "latin-1"
 
 
 def _savegame_path(game_dir: Path, savegame_dir: Path | None = None) -> Path:
@@ -65,17 +69,28 @@ def patch_resolution(game_dir: Path, width: int, height: int, *, savegame_dir: P
     logger.info("Patched resolution to %dx%d in %s", width, height, device_path)
 
 
+def _read_options(path: Path) -> str:
+    """Read options.cfg preserving its original encoding."""
+    return path.read_text(encoding=OPTIONS_ENCODING)
+
+
+def _write_options(path: Path, text: str) -> None:
+    """Write options.cfg in its original encoding."""
+    path.write_text(text, encoding=OPTIONS_ENCODING)
+
+
 def reset_controller_guid(game_dir: Path, *, savegame_dir: Path | None = None) -> None:
     """Zero out the controller GUID in options.cfg so the game uses keyboard."""
     options_path = _savegame_path(game_dir, savegame_dir) / OPTIONS_CFG
     if not options_path.exists():
         logger.warning("options.cfg not found at %s", options_path)
         return
-    text = options_path.read_text(encoding="utf-8", errors="replace")
-    # Replace controller GUID with all zeros
+    text = _read_options(options_path)
+
+    # Replace controller GUID with all zeros (handles both quoted and unquoted)
     text = re.sub(
-        r'(Settings\.Control\.ControllerGUID\s*=\s*")[^"]*(")',
-        r'\g<1>00000000-0000-0000-0000-000000000000\2',
+        r'(Settings\.Control\.ControllerGUID\s*=\s*)"[^"]*"',
+        r'\1"00000000-0000-0000-0000-000000000000"',
         text,
     )
     # Set controller index to 0
@@ -84,7 +99,7 @@ def reset_controller_guid(game_dir: Path, *, savegame_dir: Path | None = None) -
         r"\g<1>0",
         text,
     )
-    options_path.write_text(text, encoding="utf-8")
+    _write_options(options_path, text)
     logger.info("Reset controller GUID in %s", options_path)
 
 
@@ -94,8 +109,8 @@ def set_lan_port(game_dir: Path, port: int, *, savegame_dir: Path | None = None)
     if not options_path.exists():
         logger.warning("options.cfg not found at %s", options_path)
         return
-    text = options_path.read_text(encoding="utf-8", errors="replace")
-    # Try to replace existing port setting
+    text = _read_options(options_path)
+
     new_text, count = re.subn(
         r"(Settings\.Online\.LANPort\s*=\s*)\d+",
         rf"\g<1>{port}",
@@ -104,7 +119,7 @@ def set_lan_port(game_dir: Path, port: int, *, savegame_dir: Path | None = None)
     if count == 0:
         # Append the setting if it doesn't exist
         new_text = text.rstrip() + f"\nSettings.Online.LANPort = {port}\n"
-    options_path.write_text(new_text, encoding="utf-8")
+    _write_options(options_path, new_text)
     logger.info("Set LAN port to %d in %s", port, options_path)
 
 
