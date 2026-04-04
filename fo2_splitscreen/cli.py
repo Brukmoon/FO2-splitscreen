@@ -33,7 +33,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
             game_dir=args.game_dir,
             instance_count=args.players,
             resolution=tuple(int(x) for x in args.resolution.split("x")),
-            patch_resolution=args.patch_resolution,
+            patch_resolution=not args.no_patch_resolution,
             skip_intros=not args.no_skip_intros,
         )
 
@@ -186,7 +186,7 @@ def main() -> None:
     p_launch.add_argument("--players", "-p", type=int, default=2, help="Number of players (1-8)")
     p_launch.add_argument("--resolution", "-r", default="640x480", help="Resolution per player (WxH)")
     p_launch.add_argument("--config", "-c", help="Path to config.yaml")
-    p_launch.add_argument("--patch-resolution", action="store_true", help="Patch device.cfg resolution (experimental)")
+    p_launch.add_argument("--no-patch-resolution", action="store_true", help="Don't patch device.cfg resolution")
     p_launch.add_argument("--no-skip-intros", action="store_true", help="Don't skip intro videos")
     p_launch.set_defaults(func=cmd_launch)
 

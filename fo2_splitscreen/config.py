@@ -46,7 +46,7 @@ class SessionConfig:
     game_dir: str = ""
     instance_count: int = 2
     resolution: tuple[int, int] = (640, 480)
-    patch_resolution: bool = False  # Patch device.cfg binary — risky, off by default
+    patch_resolution: bool = True
     skip_intros: bool = True
     controller_assignments: list[str | None] = field(default_factory=list)
     window_positions: list[WindowRect] = field(default_factory=list)
