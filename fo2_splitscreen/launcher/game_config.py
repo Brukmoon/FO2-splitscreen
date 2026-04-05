@@ -2,6 +2,13 @@
 
 device.cfg is a binary file. Resolution is stored as two uint32 values at offset 0x78.
 options.cfg is a Lua-like text file — ANSI-encoded (latin-1), NOT UTF-8.
+
+Real options.cfg field names (from the actual game):
+  Settings.Control.ControllerGuid = "00000000000000000000000000000000"
+  Settings.Control.Controller = 0
+  Settings.Network.Port = 23756
+  Settings.Network.BroadcastPort = 23757
+  Settings.Network.GameSpyQueryPort = 23758
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ OPTIONS_CFG = "options.cfg"
 BACKUP_SUFFIX = ".bak.fo2ss"
 
 # FlatOut 2 (2006) uses ANSI encoding for its config files.
-# Using latin-1 preserves all bytes 1:1 on read/write.
+# latin-1 preserves all bytes 1:1 on read/write.
 OPTIONS_ENCODING = "latin-1"
 
 
@@ -79,6 +86,17 @@ def _write_options(path: Path, text: str) -> None:
     path.write_text(text, encoding=OPTIONS_ENCODING)
 
 
+def _replace_option(text: str, key: str, value: str) -> tuple[str, bool]:
+    """Replace an existing option value. Returns (new_text, matched).
+
+    Preserves the trailing comment (e.g. --[0 .. 65536]).
+    Never appends unknown keys — only modifies existing ones.
+    """
+    pattern = rf"({re.escape(key)}\s*=\s*)\S+"
+    new_text, count = re.subn(pattern, rf"\g<1>{value}", text)
+    return new_text, count > 0
+
+
 def reset_controller_guid(game_dir: Path, *, savegame_dir: Path | None = None) -> None:
     """Zero out the controller GUID in options.cfg so the game uses keyboard."""
     options_path = _savegame_path(game_dir, savegame_dir) / OPTIONS_CFG
@@ -87,40 +105,50 @@ def reset_controller_guid(game_dir: Path, *, savegame_dir: Path | None = None) -
         return
     text = _read_options(options_path)
 
-    # Replace controller GUID with all zeros (handles both quoted and unquoted)
+    # ControllerGuid value is a quoted hex string without dashes
     text = re.sub(
-        r'(Settings\.Control\.ControllerGUID\s*=\s*)"[^"]*"',
-        r'\1"00000000-0000-0000-0000-000000000000"',
+        r'(Settings\.Control\.ControllerGuid\s*=\s*)"[^"]*"',
+        r'\1"00000000000000000000000000000000"',
         text,
     )
-    # Set controller index to 0
-    text = re.sub(
-        r"(Settings\.Control\.Controller\s*=\s*)\d+",
-        r"\g<1>0",
-        text,
-    )
+    text, _ = _replace_option(text, "Settings.Control.Controller", "0")
+
     _write_options(options_path, text)
     logger.info("Reset controller GUID in %s", options_path)
 
 
-def set_lan_port(game_dir: Path, port: int, *, savegame_dir: Path | None = None) -> None:
-    """Set the LAN port in options.cfg for this instance."""
+def set_network_ports(game_dir: Path, instance_id: int, port_stride: int = 4, *, savegame_dir: Path | None = None) -> None:
+    """Set per-instance network ports in options.cfg.
+
+    FlatOut 2 uses three ports:
+      Settings.Network.Port          (default 23756)
+      Settings.Network.BroadcastPort (default 23757)
+      Settings.Network.GameSpyQueryPort (default 23758)
+
+    Each instance gets ports offset by instance_id * port_stride.
+    Only modifies existing keys — never appends new ones.
+    """
     options_path = _savegame_path(game_dir, savegame_dir) / OPTIONS_CFG
     if not options_path.exists():
         logger.warning("options.cfg not found at %s", options_path)
         return
     text = _read_options(options_path)
 
-    new_text, count = re.subn(
-        r"(Settings\.Online\.LANPort\s*=\s*)\d+",
-        rf"\g<1>{port}",
-        text,
-    )
-    if count == 0:
-        # Append the setting if it doesn't exist
-        new_text = text.rstrip() + f"\nSettings.Online.LANPort = {port}\n"
-    _write_options(options_path, new_text)
-    logger.info("Set LAN port to %d in %s", port, options_path)
+    base_offset = instance_id * port_stride
+    ports = {
+        "Settings.Network.Port": 23756 + base_offset,
+        "Settings.Network.BroadcastPort": 23757 + base_offset,
+        "Settings.Network.GameSpyQueryPort": 23758 + base_offset,
+    }
+
+    for key, value in ports.items():
+        text, matched = _replace_option(text, key, str(value))
+        if matched:
+            logger.info("Set %s = %d", key, value)
+        else:
+            logger.warning("Key '%s' not found in options.cfg — skipping", key)
+
+    _write_options(options_path, text)
 
 
 def create_instance_savegame(game_dir: Path, instance_id: int) -> Path:
