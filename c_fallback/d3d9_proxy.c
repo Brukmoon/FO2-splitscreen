@@ -1,41 +1,29 @@
 /*
  * d3d9.dll proxy — forces FlatOut 2 into windowed mode.
  *
- * Drop the compiled d3d9.dll into the FlatOut 2 game directory (next to
- * FlatOut2.exe). The game loads DLLs from its own directory first, so it
- * picks up this proxy instead of the system d3d9.dll.
+ * No SDK headers needed. Works with any C compiler (TCC, GCC, MSVC).
  *
- * This proxy:
- *   1. Loads the real d3d9.dll from System32
- *   2. Hooks Direct3DCreate9 to return a wrapper IDirect3D9
- *   3. The wrapper intercepts CreateDevice to set Windowed=TRUE
- *   4. All other calls pass through to the real Direct3D9
+ * How it works:
+ *   1. Game calls Direct3DCreate9 -> we load the real d3d9.dll and call it
+ *   2. We get back an IDirect3D9 COM object (a pointer to a vtable pointer)
+ *   3. We replace the CreateDevice entry in the vtable (index 16)
+ *   4. Our CreateDevice sets Windowed=TRUE, then calls the original
  *
- * Build (MinGW-w64, 32-bit — FlatOut 2 is a 32-bit game):
- *   i686-w64-mingw32-gcc -shared -o d3d9.dll d3d9_proxy.c -ld3d9 -luuid
+ * Build with TCC:
+ *   tcc -shared -o d3d9.dll d3d9_proxy.c
  *
- * Build (MSVC / Visual Studio Developer Command Prompt, 32-bit):
- *   cl /LD /DWIN32 d3d9_proxy.c /link /DEF:d3d9.def d3d9_real.lib
- *
- * Build (simple, with the provided build script):
- *   build.bat
+ * Drop d3d9.dll next to FlatOut2.exe.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define CINTERFACE
-#define COBJMACROS
 #include <windows.h>
-#include <d3d9.h>
 #include <stdio.h>
 
-/* ── Logging ────────────────────────────────────────────────────────── */
+/* ── Logging ─────────────────────────────────────────────────────── */
 
 static FILE *g_log = NULL;
 
-static void log_init(void) {
-    if (!g_log) g_log = fopen("d3d9_proxy.log", "w");
-}
 static void log_msg(const char *fmt, ...) {
+    if (!g_log) g_log = fopen("d3d9_proxy.log", "w");
     if (!g_log) return;
     va_list ap;
     va_start(ap, fmt);
@@ -44,186 +32,148 @@ static void log_msg(const char *fmt, ...) {
     fflush(g_log);
 }
 
-/* ── Real d3d9.dll ──────────────────────────────────────────────────── */
+/* ── D3DPRESENT_PARAMETERS layout (offsets we care about) ────────
+ *
+ * We only need to know where Windowed and FullScreen_RefreshRateInHz
+ * sit in the struct. They're at fixed offsets in the D3D9 ABI:
+ *
+ *   Offset  Field
+ *   0x00    BackBufferWidth          (UINT)
+ *   0x04    BackBufferHeight         (UINT)
+ *   0x08    BackBufferFormat         (UINT/enum)
+ *   0x0C    BackBufferCount          (UINT)
+ *   0x10    MultiSampleType          (UINT/enum)
+ *   0x14    MultiSampleQuality       (DWORD)
+ *   0x18    SwapEffect               (UINT/enum)
+ *   0x1C    hDeviceWindow            (HWND)
+ *   0x20    Windowed                 (BOOL)  <-- this one
+ *   0x24    EnableAutoDepthStencil   (BOOL)
+ *   0x28    AutoDepthStencilFormat   (UINT/enum)
+ *   0x2C    Flags                    (DWORD)
+ *   0x30    FullScreen_RefreshRateInHz (UINT) <-- and this one
+ *   0x34    PresentationInterval     (UINT)
+ *
+ * IDirect3D9 vtable index for CreateDevice is 16.
+ * ────────────────────────────────────────────────────────────────── */
 
-typedef IDirect3D9* (WINAPI *Direct3DCreate9_t)(UINT SDKVersion);
+#define PP_OFFSET_WIDTH       0x00
+#define PP_OFFSET_HEIGHT      0x04
+#define PP_OFFSET_WINDOWED    0x20
+#define PP_OFFSET_REFRESHRATE 0x30
+
+/* IDirect3D9 vtable: CreateDevice is method index 16 */
+#define VTABLE_INDEX_CREATEDEVICE 16
+
+/* ── Real d3d9.dll ───────────────────────────────────────────────── */
+
+typedef void* (__stdcall *Direct3DCreate9_t)(unsigned int SDKVersion);
 static HMODULE g_real_d3d9 = NULL;
 static Direct3DCreate9_t g_real_Direct3DCreate9 = NULL;
 
-static BOOL load_real_d3d9(void) {
-    char path[MAX_PATH];
-    GetSystemDirectoryA(path, MAX_PATH);
-    strcat(path, "\\d3d9.dll");
-    g_real_d3d9 = LoadLibraryA(path);
-    if (!g_real_d3d9) return FALSE;
-    g_real_Direct3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_real_d3d9, "Direct3DCreate9");
-    return g_real_Direct3DCreate9 != NULL;
-}
+/*
+ * Original CreateDevice function pointer.
+ * Signature: HRESULT __stdcall(void *this, UINT, UINT, HWND, DWORD, void *pPP, void **ppDev)
+ */
+typedef long (__stdcall *CreateDevice_t)(void *This, unsigned int Adapter,
+    unsigned int DeviceType, HWND hWnd, unsigned long BehaviorFlags,
+    void *pPresentationParameters, void **ppDevice);
 
-/* ── IDirect3D9 Wrapper ─────────────────────────────────────────────
- *
- * We wrap the IDirect3D9 vtable to intercept CreateDevice.
- * All other methods forward to the real object.
- * ──────────────────────────────────────────────────────────────────── */
+static CreateDevice_t g_original_CreateDevice = NULL;
 
-typedef struct D3D9Wrapper {
-    IDirect3D9Vtbl *lpVtbl;
-    IDirect3D9Vtbl vtbl;      /* Our modified vtable copy */
-    IDirect3D9 *real;         /* The real IDirect3D9 */
-    ULONG refcount;
-} D3D9Wrapper;
+/* ── Our hooked CreateDevice ─────────────────────────────────────── */
 
-/* Forward all calls via macros — tedious but straightforward */
-
-static HRESULT WINAPI W_QueryInterface(IDirect3D9 *This, REFIID riid, void **ppvObj) {
-    D3D9Wrapper *w = (D3D9Wrapper*)This;
-    return IDirect3D9_QueryInterface(w->real, riid, ppvObj);
-}
-static ULONG WINAPI W_AddRef(IDirect3D9 *This) {
-    D3D9Wrapper *w = (D3D9Wrapper*)This;
-    return ++w->refcount;
-}
-static ULONG WINAPI W_Release(IDirect3D9 *This) {
-    D3D9Wrapper *w = (D3D9Wrapper*)This;
-    if (--w->refcount == 0) {
-        IDirect3D9_Release(w->real);
-        free(w);
-        return 0;
-    }
-    return w->refcount;
-}
-static HRESULT WINAPI W_RegisterSoftwareDevice(IDirect3D9 *This, void *pInit) {
-    return IDirect3D9_RegisterSoftwareDevice(((D3D9Wrapper*)This)->real, pInit);
-}
-static UINT WINAPI W_GetAdapterCount(IDirect3D9 *This) {
-    return IDirect3D9_GetAdapterCount(((D3D9Wrapper*)This)->real);
-}
-static HRESULT WINAPI W_GetAdapterIdentifier(IDirect3D9 *This, UINT a, DWORD b, D3DADAPTER_IDENTIFIER9 *c) {
-    return IDirect3D9_GetAdapterIdentifier(((D3D9Wrapper*)This)->real, a, b, c);
-}
-static UINT WINAPI W_GetAdapterModeCount(IDirect3D9 *This, UINT a, D3DFORMAT b) {
-    return IDirect3D9_GetAdapterModeCount(((D3D9Wrapper*)This)->real, a, b);
-}
-static HRESULT WINAPI W_EnumAdapterModes(IDirect3D9 *This, UINT a, D3DFORMAT b, UINT c, D3DDISPLAYMODE *d) {
-    return IDirect3D9_EnumAdapterModes(((D3D9Wrapper*)This)->real, a, b, c, d);
-}
-static HRESULT WINAPI W_GetAdapterDisplayMode(IDirect3D9 *This, UINT a, D3DDISPLAYMODE *b) {
-    return IDirect3D9_GetAdapterDisplayMode(((D3D9Wrapper*)This)->real, a, b);
-}
-static HRESULT WINAPI W_CheckDeviceType(IDirect3D9 *This, UINT a, D3DDEVTYPE b, D3DFORMAT c, D3DFORMAT d, BOOL e) {
-    return IDirect3D9_CheckDeviceType(((D3D9Wrapper*)This)->real, a, b, c, d, e);
-}
-static HRESULT WINAPI W_CheckDeviceFormat(IDirect3D9 *This, UINT a, D3DDEVTYPE b, D3DFORMAT c, DWORD d, D3DRESOURCETYPE e, D3DFORMAT f) {
-    return IDirect3D9_CheckDeviceFormat(((D3D9Wrapper*)This)->real, a, b, c, d, e, f);
-}
-static HRESULT WINAPI W_CheckDeviceMultiSampleType(IDirect3D9 *This, UINT a, D3DDEVTYPE b, D3DFORMAT c, BOOL d, D3DMULTISAMPLE_TYPE e, DWORD *f) {
-    return IDirect3D9_CheckDeviceMultiSampleType(((D3D9Wrapper*)This)->real, a, b, c, d, e, f);
-}
-static HRESULT WINAPI W_CheckDepthStencilMatch(IDirect3D9 *This, UINT a, D3DDEVTYPE b, D3DFORMAT c, D3DFORMAT d, D3DFORMAT e) {
-    return IDirect3D9_CheckDepthStencilMatch(((D3D9Wrapper*)This)->real, a, b, c, d, e);
-}
-static HRESULT WINAPI W_CheckDeviceFormatConversion(IDirect3D9 *This, UINT a, D3DDEVTYPE b, D3DFORMAT c, D3DFORMAT d) {
-    return IDirect3D9_CheckDeviceFormatConversion(((D3D9Wrapper*)This)->real, a, b, c, d);
-}
-static HRESULT WINAPI W_GetDeviceCaps(IDirect3D9 *This, UINT a, D3DDEVTYPE b, D3DCAPS9 *c) {
-    return IDirect3D9_GetDeviceCaps(((D3D9Wrapper*)This)->real, a, b, c);
-}
-static HMONITOR WINAPI W_GetAdapterMonitor(IDirect3D9 *This, UINT a) {
-    return IDirect3D9_GetAdapterMonitor(((D3D9Wrapper*)This)->real, a);
-}
-
-/* ── The important one: CreateDevice ─────────────────────────────── */
-
-static HRESULT WINAPI W_CreateDevice(
-    IDirect3D9 *This,
-    UINT Adapter,
-    D3DDEVTYPE DeviceType,
-    HWND hFocusWindow,
-    DWORD BehaviorFlags,
-    D3DPRESENT_PARAMETERS *pPresentationParameters,
-    IDirect3DDevice9 **ppReturnedDeviceInterface
+static long __stdcall Hooked_CreateDevice(
+    void *This,
+    unsigned int Adapter,
+    unsigned int DeviceType,
+    HWND hWnd,
+    unsigned long BehaviorFlags,
+    void *pPresentationParameters,
+    void **ppDevice
 ) {
-    D3D9Wrapper *w = (D3D9Wrapper*)This;
+    unsigned char *pp = (unsigned char*)pPresentationParameters;
 
-    log_msg("CreateDevice intercepted: Windowed=%d, %dx%d\n",
-            pPresentationParameters->Windowed,
-            pPresentationParameters->BackBufferWidth,
-            pPresentationParameters->BackBufferHeight);
+    unsigned int w = *(unsigned int*)(pp + PP_OFFSET_WIDTH);
+    unsigned int h = *(unsigned int*)(pp + PP_OFFSET_HEIGHT);
+
+    log_msg("CreateDevice intercepted: %ux%u, Windowed=%d\n",
+            w, h, *(int*)(pp + PP_OFFSET_WINDOWED));
 
     /* Force windowed mode */
-    pPresentationParameters->Windowed = TRUE;
-    pPresentationParameters->FullScreen_RefreshRateInHz = 0;
+    *(int*)(pp + PP_OFFSET_WINDOWED) = 1;     /* TRUE */
+    *(unsigned int*)(pp + PP_OFFSET_REFRESHRATE) = 0;
 
-    log_msg("Forced windowed mode: %dx%d\n",
-            pPresentationParameters->BackBufferWidth,
-            pPresentationParameters->BackBufferHeight);
+    log_msg("Forced windowed: %ux%u\n", w, h);
 
-    return IDirect3D9_CreateDevice(w->real, Adapter, DeviceType, hFocusWindow,
+    return g_original_CreateDevice(This, Adapter, DeviceType, hWnd,
                                    BehaviorFlags, pPresentationParameters,
-                                   ppReturnedDeviceInterface);
+                                   ppDevice);
 }
 
-/* ── Wrapper construction ────────────────────────────────────────── */
+/* ── Hook installation ───────────────────────────────────────────── */
 
-static IDirect3D9* wrap_d3d9(IDirect3D9 *real) {
-    D3D9Wrapper *w = (D3D9Wrapper*)malloc(sizeof(D3D9Wrapper));
-    if (!w) return real;
+static void hook_vtable(void *pD3D9) {
+    /*
+     * COM object layout:  pD3D9 -> [lpVtbl] -> [fn0, fn1, ..., fn16, ...]
+     * We patch fn16 (CreateDevice) in the vtable.
+     */
+    void ***ppVtbl = (void***)pD3D9;    /* pD3D9->lpVtbl */
+    void **vtbl = *ppVtbl;              /* the actual vtable array */
 
-    w->real = real;
-    w->refcount = 1;
+    g_original_CreateDevice = (CreateDevice_t)vtbl[VTABLE_INDEX_CREATEDEVICE];
 
-    /* Copy the real vtable and override CreateDevice */
-    w->vtbl = *real->lpVtbl;
-    w->vtbl.QueryInterface             = W_QueryInterface;
-    w->vtbl.AddRef                     = W_AddRef;
-    w->vtbl.Release                    = W_Release;
-    w->vtbl.RegisterSoftwareDevice     = W_RegisterSoftwareDevice;
-    w->vtbl.GetAdapterCount            = W_GetAdapterCount;
-    w->vtbl.GetAdapterIdentifier       = W_GetAdapterIdentifier;
-    w->vtbl.GetAdapterModeCount        = W_GetAdapterModeCount;
-    w->vtbl.EnumAdapterModes           = W_EnumAdapterModes;
-    w->vtbl.GetAdapterDisplayMode      = W_GetAdapterDisplayMode;
-    w->vtbl.CheckDeviceType            = W_CheckDeviceType;
-    w->vtbl.CheckDeviceFormat          = W_CheckDeviceFormat;
-    w->vtbl.CheckDeviceMultiSampleType = W_CheckDeviceMultiSampleType;
-    w->vtbl.CheckDepthStencilMatch     = W_CheckDepthStencilMatch;
-    w->vtbl.CheckDeviceFormatConversion= W_CheckDeviceFormatConversion;
-    w->vtbl.GetDeviceCaps              = W_GetDeviceCaps;
-    w->vtbl.GetAdapterMonitor          = W_GetAdapterMonitor;
-    w->vtbl.CreateDevice               = W_CreateDevice;
+    /* Unprotect the vtable entry so we can write to it */
+    DWORD oldProtect;
+    VirtualProtect(&vtbl[VTABLE_INDEX_CREATEDEVICE], sizeof(void*),
+                   PAGE_EXECUTE_READWRITE, &oldProtect);
 
-    w->lpVtbl = &w->vtbl;
+    vtbl[VTABLE_INDEX_CREATEDEVICE] = (void*)Hooked_CreateDevice;
 
-    log_msg("IDirect3D9 wrapped successfully\n");
-    return (IDirect3D9*)w;
+    VirtualProtect(&vtbl[VTABLE_INDEX_CREATEDEVICE], sizeof(void*),
+                   oldProtect, &oldProtect);
+
+    log_msg("Hooked CreateDevice at vtable[%d]\n", VTABLE_INDEX_CREATEDEVICE);
 }
 
 /* ── Exported function ───────────────────────────────────────────── */
 
-__declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
-    log_init();
-    log_msg("Direct3DCreate9 called (SDK %u)\n", SDKVersion);
+__declspec(dllexport) void* __stdcall Direct3DCreate9(unsigned int SDKVersion) {
+    log_msg("Direct3DCreate9(SDK %u)\n", SDKVersion);
 
-    if (!g_real_Direct3DCreate9 && !load_real_d3d9()) {
-        log_msg("FATAL: Could not load real d3d9.dll\n");
-        return NULL;
+    if (!g_real_d3d9) {
+        char path[MAX_PATH];
+        GetSystemDirectoryA(path, MAX_PATH);
+        strcat(path, "\\d3d9.dll");
+        g_real_d3d9 = LoadLibraryA(path);
+        if (!g_real_d3d9) {
+            log_msg("FATAL: Cannot load %s\n", path);
+            return NULL;
+        }
+        g_real_Direct3DCreate9 = (Direct3DCreate9_t)
+            GetProcAddress(g_real_d3d9, "Direct3DCreate9");
+        if (!g_real_Direct3DCreate9) {
+            log_msg("FATAL: Direct3DCreate9 not found in real dll\n");
+            return NULL;
+        }
     }
 
-    IDirect3D9 *real = g_real_Direct3DCreate9(SDKVersion);
-    if (!real) {
+    void *pD3D9 = g_real_Direct3DCreate9(SDKVersion);
+    if (!pD3D9) {
         log_msg("Real Direct3DCreate9 returned NULL\n");
         return NULL;
     }
 
-    return wrap_d3d9(real);
+    hook_vtable(pD3D9);
+    return pD3D9;
 }
 
 /* ── DLL entry point ─────────────────────────────────────────────── */
 
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+BOOL __stdcall DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)hinstDLL; (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_DETACH && g_real_d3d9) {
         FreeLibrary(g_real_d3d9);
+        if (g_log) fclose(g_log);
     }
     return TRUE;
 }
