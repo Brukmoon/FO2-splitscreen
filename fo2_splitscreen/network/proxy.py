@@ -1,194 +1,155 @@
-"""Asyncio UDP relay proxy for virtual LAN between FlatOut 2 instances.
+"""Simple UDP broadcast relay for FlatOut 2 LAN play.
 
-Each game instance binds to a different LAN port (configured via options.cfg).
-The proxy intercepts traffic and relays between instances, enabling LAN
-discovery and gameplay across instances on the same machine.
+When instances use different ports (--change-ports), they can't discover
+each other. This relay bridges discovery traffic between port sets.
 
 Architecture:
-  Instance 0 (host):   query_port=23756, game_port=23757
-  Instance 1 (client): query_port=23760, game_port=23761
+  Instance 0: Port=23756, BroadcastPort=23757
+  Instance 1: Port=23760, BroadcastPort=23761
 
-  The proxy does NOT bind the game's ports (the game itself binds them).
-  Instead, it binds separate relay ports and uses them to forward packets
-  between instances via localhost.
+  The relay forwards broadcast/discovery packets between instances
+  so they can find each other despite using different ports.
 
-Discovery flow:
-  1. Instance 1 broadcasts a LAN query on its query_port
-  2. Proxy captures it and forwards to instance 0's query_port
-  3. Instance 0 replies; proxy forwards reply back to instance 1
+When instances use the SAME ports (default), this relay is NOT needed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+import socket
+from dataclasses import dataclass
 
 from ..config import NetworkConfig
 
 logger = logging.getLogger(__name__)
 
-# The proxy relay port offset — relay sockets bind at game_port + RELAY_OFFSET
-# to avoid conflicting with the game's own port bindings.
-RELAY_PORT_OFFSET = 100
-
 
 @dataclass
-class InstanceEndpoint:
+class InstancePorts:
     instance_id: int
-    query_port: int
-    game_port: int
+    port: int           # Settings.Network.Port
+    broadcast_port: int  # Settings.Network.BroadcastPort
+    query_port: int      # Settings.Network.GameSpyQueryPort
 
 
-class RelayProtocol(asyncio.DatagramProtocol):
-    """UDP protocol that relays packets between game instances."""
+class BroadcastRelay:
+    """Relays UDP packets between game instances on different port sets.
 
-    def __init__(self, proxy: LANProxy, port_label: str) -> None:
-        self.proxy = proxy
-        self.port_label = port_label
-        self.transport: asyncio.DatagramTransport | None = None
-
-    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
-        self.transport = transport
-
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        self.proxy.handle_packet(data, addr, self.port_label)
-
-    def error_received(self, exc: Exception) -> None:
-        logger.error("UDP error on %s: %s", self.port_label, exc)
-
-    def send_to(self, data: bytes, addr: tuple[str, int]) -> None:
-        if self.transport:
-            self.transport.sendto(data, addr)
-
-
-class LANProxy:
-    """Central relay that bridges FlatOut 2 LAN traffic between instances.
-
-    For each instance, the proxy creates a relay socket. When the game sends
-    a packet, the proxy's relay socket for the TARGET instance forwards it
-    to that instance's game port on localhost.
-
-    This avoids the bootstrap problem: the proxy always knows where each
-    instance listens (its configured query_port/game_port on 127.0.0.1),
-    so it can forward immediately without waiting for the target to send first.
+    For each port type (Port, BroadcastPort, GameSpyQueryPort), the relay
+    listens on a separate socket and forwards incoming packets to all other
+    instances' corresponding ports.
     """
 
-    def __init__(self, network_config: NetworkConfig, instance_count: int) -> None:
-        self.config = network_config
-        self.instance_count = instance_count
-        self.endpoints: list[InstanceEndpoint] = []
-        # label -> RelayProtocol (e.g. "query_0", "game_1")
-        self.protocols: dict[str, RelayProtocol] = {}
-        # Track which source port belongs to which instance
-        self._source_port_to_instance: dict[int, int] = {}
-
-        for i in range(instance_count):
-            ep = InstanceEndpoint(
-                instance_id=i,
-                query_port=network_config.query_port_for(i),
-                game_port=network_config.game_port_for(i),
-            )
-            self.endpoints.append(ep)
+    def __init__(self, instances: list[InstancePorts]) -> None:
+        self.instances = instances
+        self._transports: list[asyncio.DatagramTransport] = []
+        self._running = False
 
     async def start(self) -> None:
-        """Create relay sockets for all instances.
-
-        For each instance, we create two relay sockets:
-        - One for query traffic (discovery)
-        - One for game traffic
-
-        These relay sockets listen on separate ports and forward to the
-        appropriate game instance ports.
-        """
+        """Start relay sockets for all port types."""
         loop = asyncio.get_running_loop()
 
-        for ep in self.endpoints:
-            for kind, game_port in [("query", ep.query_port), ("game", ep.game_port)]:
-                relay_port = game_port + RELAY_PORT_OFFSET
-                label = f"{kind}_{ep.instance_id}"
+        for inst in self.instances:
+            for port_type, port in [
+                ("broadcast", inst.broadcast_port),
+                ("query", inst.query_port),
+            ]:
                 try:
-                    transport, protocol = await loop.create_datagram_endpoint(
-                        lambda lbl=label: RelayProtocol(self, lbl),
-                        local_addr=("127.0.0.1", relay_port),
+                    # Create a socket that can receive broadcasts
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    sock.bind(("0.0.0.0", port))
+                    sock.setblocking(False)
+
+                    transport, _ = await loop.create_datagram_endpoint(
+                        lambda i=inst.instance_id, pt=port_type: _RelayProtocol(
+                            self, i, pt
+                        ),
+                        sock=sock,
                     )
-                    self.protocols[label] = protocol
+                    self._transports.append(transport)
                     logger.info(
-                        "Relay %s listening on 127.0.0.1:%d (forwards to game port %d)",
-                        label, relay_port, game_port,
+                        "Relay listening on port %d for instance %d (%s)",
+                        port, inst.instance_id, port_type,
                     )
                 except OSError as e:
-                    logger.error("Failed to bind relay port %d: %s", relay_port, e)
-
-        # Also listen on each game port to intercept outgoing game traffic.
-        # But the game binds these ports — so we use a sniffer approach:
-        # We set SO_REUSEADDR to share the port with the game.
-        for ep in self.endpoints:
-            for kind, port in [("query", ep.query_port), ("game", ep.game_port)]:
-                label = f"sniff_{kind}_{ep.instance_id}"
-                try:
-                    transport, protocol = await loop.create_datagram_endpoint(
-                        lambda lbl=label: RelayProtocol(self, lbl),
-                        local_addr=("127.0.0.1", port),
-                        reuse_port=True,
-                    )
-                    self.protocols[label] = protocol
-                    self._source_port_to_instance[port] = ep.instance_id
-                    logger.info("Sniffer %s on 127.0.0.1:%d", label, port)
-                except OSError:
-                    # Expected on Windows — SO_REUSEPORT not supported.
-                    # Fall back to proxy-only approach without sniffing.
-                    logger.debug(
-                        "Could not share port %d (expected on Windows), "
-                        "using relay-only mode",
-                        port,
+                    logger.warning(
+                        "Cannot bind relay port %d (instance %d, %s): %s — "
+                        "game may already be using it",
+                        port, inst.instance_id, port_type, e,
                     )
 
-    def handle_packet(self, data: bytes, addr: tuple[str, int], port_label: str) -> None:
-        """Route a received packet to other instances."""
-        # Determine source instance from the label or source address
-        parts = port_label.split("_")
-        if parts[0] == "sniff":
-            # Packet from a game instance's bound port
-            kind = parts[1]  # "query" or "game"
-            source_id = int(parts[2])
-            self._forward_to_others(data, source_id, kind)
-        else:
-            # Packet received on a relay socket — this is a response
-            # from a game instance, forward it back
-            kind = parts[0]
-            relay_instance = int(parts[1])
-            # The game sent this to our relay port thinking it was another player.
-            # Forward to all other instances.
-            self._forward_to_others(data, relay_instance, kind)
+        self._running = True
+        logger.info("Broadcast relay started for %d instances", len(self.instances))
 
-    def _forward_to_others(self, data: bytes, source_instance: int, kind: str) -> None:
-        """Forward a packet from source_instance to all other instances."""
-        for ep in self.endpoints:
-            if ep.instance_id == source_instance:
+    def forward(self, data: bytes, source_instance: int, port_type: str) -> None:
+        """Forward a packet from source to all other instances."""
+        for inst in self.instances:
+            if inst.instance_id == source_instance:
                 continue
-            target_port = ep.query_port if kind == "query" else ep.game_port
-            # Send from our relay socket for this target to the target's game port
-            relay_label = f"{kind}_{ep.instance_id}"
-            protocol = self.protocols.get(relay_label)
-            if protocol:
-                protocol.send_to(data, ("127.0.0.1", target_port))
-                logger.debug(
-                    "Forwarded %d bytes: instance %d -> instance %d (%s port %d)",
-                    len(data), source_instance, ep.instance_id, kind, target_port,
-                )
+            target_port = (
+                inst.broadcast_port if port_type == "broadcast"
+                else inst.query_port
+            )
+            # Send to localhost since all instances are on the same machine
+            for transport in self._transports:
+                try:
+                    transport.sendto(data, ("127.0.0.1", target_port))
+                    logger.debug(
+                        "Relayed %d bytes: instance %d -> %d (%s, port %d)",
+                        len(data), source_instance, inst.instance_id,
+                        port_type, target_port,
+                    )
+                    break  # Only need one transport to send
+                except Exception:
+                    continue
 
     async def stop(self) -> None:
-        """Close all sockets."""
-        for protocol in self.protocols.values():
-            if protocol.transport:
-                protocol.transport.close()
-        self.protocols.clear()
-        logger.info("Proxy stopped")
+        """Close all relay sockets."""
+        for transport in self._transports:
+            transport.close()
+        self._transports.clear()
+        self._running = False
+        logger.info("Broadcast relay stopped")
 
 
-async def run_proxy(network_config: NetworkConfig, instance_count: int) -> LANProxy:
-    """Create and start the LAN proxy. Returns the proxy (call stop() to shut down)."""
-    proxy = LANProxy(network_config, instance_count)
-    await proxy.start()
-    return proxy
+class _RelayProtocol(asyncio.DatagramProtocol):
+    def __init__(self, relay: BroadcastRelay, instance_id: int, port_type: str):
+        self.relay = relay
+        self.instance_id = instance_id
+        self.port_type = port_type
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        self.relay.forward(data, self.instance_id, self.port_type)
+
+    def error_received(self, exc: Exception) -> None:
+        logger.debug("Relay UDP error (instance %d, %s): %s",
+                      self.instance_id, self.port_type, exc)
+
+
+def build_instance_ports(
+    network_config: NetworkConfig, instance_count: int
+) -> list[InstancePorts]:
+    """Build the port configuration for each instance."""
+    result = []
+    for i in range(instance_count):
+        base_offset = i * network_config.port_stride
+        result.append(InstancePorts(
+            instance_id=i,
+            port=23756 + base_offset,
+            broadcast_port=23757 + base_offset,
+            query_port=23758 + base_offset,
+        ))
+    return result
+
+
+async def run_relay(
+    network_config: NetworkConfig, instance_count: int
+) -> BroadcastRelay:
+    """Create and start the broadcast relay."""
+    instances = build_instance_ports(network_config, instance_count)
+    relay = BroadcastRelay(instances)
+    await relay.start()
+    return relay

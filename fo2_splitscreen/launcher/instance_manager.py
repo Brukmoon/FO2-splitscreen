@@ -62,11 +62,12 @@ class InstanceManager:
                 w, h = self.config.resolution
                 patch_resolution(self.game_dir, w, h, savegame_dir=inst_dir)
             reset_controller_guid(self.game_dir, savegame_dir=inst_dir)
-            set_network_ports(
-                self.game_dir, i,
-                port_stride=self.config.network.port_stride,
-                savegame_dir=inst_dir,
-            )
+            if self.config.change_network_ports:
+                set_network_ports(
+                    self.game_dir, i,
+                    port_stride=self.config.network.port_stride,
+                    savegame_dir=inst_dir,
+                )
             self.instance_dirs.append(inst_dir)
 
         logger.info("Prepared %d instances", self.config.instance_count)

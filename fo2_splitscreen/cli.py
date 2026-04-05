@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import signal
 import shutil
 import threading
+import time
 from pathlib import Path
 
 from .config import SessionConfig
@@ -21,6 +23,67 @@ def setup_logging(level: str) -> None:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+# Seconds to wait after window appears before positioning.
+# dgVoodoo2 / D3D9 wrappers may resize the window shortly after creation.
+WINDOW_SETTLE_DELAY = 3.0
+
+
+def _position_windows(config: SessionConfig, pids: list[int], logger) -> None:
+    """Position and make borderless all game windows (Windows only).
+
+    FlatOut 2 shows a launcher dialog first. The user must click "Play"
+    in each launcher. We wait for the actual game render windows to appear
+    (detected by window class or size), then position them.
+    """
+    if os.name != "nt":
+        return
+
+    from .window.manager import (
+        make_borderless, position_window, wait_for_game_window,
+    )
+
+    logger.info(
+        "Click 'Play' in each FlatOut 2 launcher. "
+        "Windows will be positioned automatically."
+    )
+
+    # Wait for game windows (not launcher dialogs)
+    windows: list[tuple[int, int]] = []  # (instance_id, hwnd)
+    for i, pid in enumerate(pids):
+        try:
+            hwnd = wait_for_game_window(pid, timeout=120)
+            windows.append((i, hwnd))
+        except TimeoutError:
+            logger.error(
+                "Timed out waiting for game window of instance %d (PID %d). "
+                "Did you click 'Play' in the launcher?",
+                i, pid,
+            )
+
+    if not windows:
+        return
+
+    # Wait for D3D9 / dgVoodoo2 to finish initializing
+    logger.info("Waiting %.0fs for game windows to settle...", WINDOW_SETTLE_DELAY)
+    time.sleep(WINDOW_SETTLE_DELAY)
+
+    # Position and make borderless
+    for i, hwnd in windows:
+        if i >= len(config.window_positions):
+            logger.warning("No window position for instance %d, skipping", i)
+            continue
+        try:
+            pos = config.window_positions[i]
+            make_borderless(hwnd)
+            position_window(hwnd, pos.x, pos.y, pos.width, pos.height)
+            logger.info(
+                "Instance %d: window at (%d, %d) size %dx%d",
+                i, pos.x, pos.y, pos.width, pos.height,
+            )
+        except OSError as e:
+            logger.error("Window setup failed for instance %d: %s", i, e)
 
 
 def cmd_launch(args: argparse.Namespace) -> None:
@@ -37,6 +100,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
             resolution=tuple(int(x) for x in args.resolution.split("x")),
             patch_resolution=not args.no_patch_resolution,
             skip_intros=not args.no_skip_intros,
+            change_network_ports=args.change_ports,
         )
 
     setup_logging(config.log_level)
@@ -63,6 +127,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
         )
 
     manager = InstanceManager(config)
+    relay = None
 
     # Handle Ctrl+C gracefully
     shutdown_event = threading.Event()
@@ -77,28 +142,33 @@ def cmd_launch(args: argparse.Namespace) -> None:
         logger.info("Preparing %d instances...", config.instance_count)
         manager.prepare()
 
+        # Start network relay if using different ports per instance
+        if config.change_network_ports:
+            logger.info("Starting network relay (port bridging)...")
+            try:
+                from .network.proxy import run_relay
+                loop = asyncio.new_event_loop()
+                relay = loop.run_until_complete(
+                    run_relay(config.network, config.instance_count)
+                )
+                # Run the event loop in a background thread
+                relay_thread = threading.Thread(
+                    target=loop.run_forever, daemon=True
+                )
+                relay_thread.start()
+                logger.info("Network relay running")
+            except Exception as e:
+                logger.warning("Network relay failed to start: %s", e)
+                logger.warning(
+                    "LAN discovery may not work between instances. "
+                    "Try without --change-ports."
+                )
+
         logger.info("Launching instances...")
         pids = manager.launch_all()
 
         # Position windows (Windows only)
-        if os.name == "nt":
-            from .window.manager import make_borderless, position_window, wait_for_window
-
-            for i, pid in enumerate(pids):
-                if i >= len(config.window_positions):
-                    logger.warning("No window position for instance %d, skipping", i)
-                    continue
-                try:
-                    hwnd = wait_for_window(pid, timeout=30)
-                    pos = config.window_positions[i]
-                    make_borderless(hwnd)
-                    position_window(hwnd, pos.x, pos.y, pos.width, pos.height)
-                except TimeoutError:
-                    logger.error(
-                        "Timed out waiting for window of instance %d (PID %d)", i, pid
-                    )
-                except OSError as e:
-                    logger.error("Window setup failed for instance %d: %s", i, e)
+        _position_windows(config, pids, logger)
 
         # Apply memory patches if configured (Windows only)
         if config.skip_intros and os.name == "nt":
@@ -120,6 +190,12 @@ def cmd_launch(args: argparse.Namespace) -> None:
             except ImportError:
                 logger.warning("pymem not installed — skipping memory patches")
 
+        if not config.change_network_ports:
+            logger.info(
+                "All instances use the same network ports. "
+                "In-game: one player hosts a LAN game, others join."
+            )
+
         logger.info("All instances running. Press Ctrl+C to stop.")
         shutdown_event.wait()
 
@@ -131,6 +207,11 @@ def cmd_launch(args: argparse.Namespace) -> None:
     except Exception:
         logger.exception("Unexpected error")
     finally:
+        if relay:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
         manager.shutdown()
 
 
@@ -236,6 +317,7 @@ def main() -> None:
     p_launch.add_argument("--config", "-c", help="Path to config.yaml")
     p_launch.add_argument("--no-patch-resolution", action="store_true", help="Don't patch device.cfg resolution")
     p_launch.add_argument("--no-skip-intros", action="store_true", help="Don't skip intro videos")
+    p_launch.add_argument("--change-ports", action="store_true", help="Use different network ports per instance (requires relay)")
     p_launch.set_defaults(func=cmd_launch)
 
     # restore

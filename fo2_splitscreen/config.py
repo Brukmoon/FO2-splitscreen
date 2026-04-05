@@ -48,6 +48,7 @@ class SessionConfig:
     resolution: tuple[int, int] = (640, 480)
     patch_resolution: bool = True
     skip_intros: bool = True
+    change_network_ports: bool = False
     controller_assignments: list[str | None] = field(default_factory=list)
     window_positions: list[WindowRect] = field(default_factory=list)
     network: NetworkConfig = field(default_factory=NetworkConfig)
@@ -112,6 +113,7 @@ class SessionConfig:
             "resolution": list(self.resolution),
             "patch_resolution": self.patch_resolution,
             "skip_intros": self.skip_intros,
+            "change_network_ports": self.change_network_ports,
             "log_level": self.log_level,
             "controller_assignments": self.controller_assignments,
             "window_positions": [
