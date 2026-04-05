@@ -6,11 +6,13 @@ import argparse
 import logging
 import os
 import signal
+import shutil
 import threading
 from pathlib import Path
 
 from .config import SessionConfig
 from .launcher.instance_manager import InstanceManager
+from .launcher.game_config import restore_config
 
 
 def setup_logging(level: str) -> None:
@@ -53,7 +55,6 @@ def cmd_launch(args: argparse.Namespace) -> None:
             monitor = get_primary_monitor()
             screen_w, screen_h = monitor.width, monitor.height
         else:
-            # Fallback for non-Windows development
             screen_w, screen_h = 1920, 1080
         config.compute_default_layout(screen_w, screen_h)
         logger.info(
@@ -127,8 +128,55 @@ def cmd_launch(args: argparse.Namespace) -> None:
         raise SystemExit(1)
     except KeyboardInterrupt:
         pass
+    except Exception:
+        logger.exception("Unexpected error")
     finally:
         manager.shutdown()
+
+
+def cmd_restore(args: argparse.Namespace) -> None:
+    """Restore original game config files after a crash."""
+    setup_logging("INFO")
+    game_dir = Path(args.game_dir)
+    sg = game_dir / "Savegame"
+
+    if not sg.exists():
+        print(f"Error: Savegame directory not found at {sg}")
+        raise SystemExit(1)
+
+    # Restore config backups
+    restored = False
+    for name in ("device.cfg", "options.cfg"):
+        bak = sg / (name + ".bak.fo2ss")
+        dst = sg / name
+        if bak.exists():
+            shutil.copy2(bak, dst)
+            bak.unlink()
+            print(f"Restored {name} from backup")
+            restored = True
+
+    # Clean up leftover instance dirs
+    for p in game_dir.glob("Savegame_instance_*"):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            print(f"Removed {p.name}")
+            restored = True
+
+    # Clean up leftover from old junction-based code
+    old_backup = game_dir / "Savegame_original"
+    if old_backup.exists():
+        if not sg.exists():
+            old_backup.rename(sg)
+            print("Restored Savegame from Savegame_original")
+        else:
+            shutil.rmtree(old_backup, ignore_errors=True)
+            print("Removed leftover Savegame_original")
+        restored = True
+
+    if restored:
+        print("Done. Game files restored.")
+    else:
+        print("Nothing to restore — no backup files found.")
 
 
 def cmd_config_create(args: argparse.Namespace) -> None:
@@ -189,6 +237,11 @@ def main() -> None:
     p_launch.add_argument("--no-patch-resolution", action="store_true", help="Don't patch device.cfg resolution")
     p_launch.add_argument("--no-skip-intros", action="store_true", help="Don't skip intro videos")
     p_launch.set_defaults(func=cmd_launch)
+
+    # restore
+    p_restore = sub.add_parser("restore", help="Restore game files after a crash")
+    p_restore.add_argument("--game-dir", "-g", required=True, help="Path to FlatOut 2 installation")
+    p_restore.set_defaults(func=cmd_restore)
 
     # config
     p_config = sub.add_parser("config", help="Create configuration file")
